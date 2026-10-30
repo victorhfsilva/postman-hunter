@@ -22,7 +22,14 @@ from secret_hunter.discovery import discover_subdomains, read_domains_file
 from secret_hunter.patterns import extract_candidates
 from secret_hunter.providers import ProviderConfig, LlmClient, ProviderError
 
-from .postman_api import collection_text, fetch_collection, search_postman
+from .postman_api import (
+    collection_meta,
+    collection_segments,
+    collection_uuid,
+    entity_url,
+    fetch_collection,
+    search_postman,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -114,15 +121,33 @@ def _search_all(targets: list[str], api_key: str | None, timeout: float,
 
 
 def _fetch_all_collections(ids: list[str], timeout: float, concurrency: int,
-                           proxy: str | None) -> list[dict]:
-    fetched: list[dict] = []
+                           proxy: str | None) -> list[tuple[str, dict]]:
+    """Fetch collections, preserving the requested id for attribution."""
+    fetched: list[tuple[str, dict]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
         futures = {pool.submit(fetch_collection, cid, timeout, proxy): cid for cid in ids}
         for fut in concurrent.futures.as_completed(futures):
+            cid = futures[fut]
             data = fut.result()
             if data:
-                fetched.append(data)
+                fetched.append((cid, data))
     return fetched
+
+
+def _origin_for(candidate_source: str, meta: dict, request: str | None,
+                document: bool = False) -> dict:
+    """Build the attribution record stored on a finding."""
+    return {
+        "source": candidate_source,
+        "collection": meta.get("name", ""),
+        "collection_id": meta.get("id", ""),
+        "collection_public_id": meta.get("public_id", ""),
+        "collection_url": meta.get("url", ""),
+        "workspace": meta.get("workspace", ""),
+        "publisher": meta.get("publisher", ""),
+        "request": request or None,
+        "document": document,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -143,25 +168,59 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[*] Searching Postman for {len(targets)} domain(s)/subdomain(s)...")
     results = _search_all(targets, api_key, args.timeout, args.concurrency, args.proxy)
 
-    # Scan search metadata (names/URLs) and then full collections.
-    meta_text = "\n".join(
-        f"{r.get('name', '')} {r.get('url', '')} {r.get('publisher', '')} {r.get('query', '')}"
-        for r in results
-    )
-    candidates: list[Any] = extract_candidates(meta_text, "postman-search-results")
+    # Index search-phase metadata by id so fetched collections can inherit the
+    # display name, workspace, publisher and a public link.
+    meta_by_id: dict[str, dict] = {}
+    for r in results:
+        rid = r.get("id")
+        if rid:
+            meta_by_id.setdefault(str(rid), r)
 
+    candidates: list[Any] = []
+    origins: dict[tuple[str, str], list[dict]] = {}
+
+    def _collect(cand_list, origin):
+        for c in cand_list:
+            bucket = origins.setdefault((c.label, c.value), [])
+            if origin not in bucket:
+                bucket.append(origin)
+            candidates.append(c)
+
+    # 1) Search-result metadata: attribute every hit to its own entity.
+    for r in results:
+        text = f"{r.get('name', '')} {r.get('url', '')} {r.get('publisher', '')} {r.get('query', '')}"
+        etype = r.get("type", "entity")
+        meta = {
+            "name": r.get("name", ""),
+            "id": collection_uuid(r.get("id", "")),
+            "public_id": r.get("id", ""),
+            "workspace": r.get("workspace", ""),
+            "publisher": r.get("publisher", ""),
+            "url": r.get("url", "") or entity_url(etype, r.get("id", ""), r.get("workspaceSlug", "")),
+            "source": f"postman-{etype}:{r.get('id', '?')}",
+        }
+        _collect(extract_candidates(text, meta["source"]), _origin_for(meta["source"], meta, None))
+
+    # 2) Full collections: scan each request segment so a candidate records the
+    #    exact collection and request it came from.
     collection_ids = [r["id"] for r in results if r.get("type") == "collection" and r.get("id")]
     collection_ids = list(dict.fromkeys(collection_ids))[: max(0, args.max_collections)]
 
     collections_fetched = 0
     requests_count = 0
-    for coll in _fetch_all_collections(collection_ids, args.timeout, args.concurrency, args.proxy):
+    for requested_id, coll in _fetch_all_collections(collection_ids, args.timeout, args.concurrency, args.proxy):
         collections_fetched += 1
-        text = collection_text(coll)
         requests_count += _count_requests(coll)
-        candidates.extend(extract_candidates(text, f"postman-collection:{coll.get('id', '?')}"))
+        meta = collection_meta(coll, requested_id, meta_by_id.get(str(requested_id)))
+        for label, seg_text in collection_segments(coll):
+            container_labels = ("collection variables", "collection auth", "(full document)")
+            request_name = None if label in container_labels else label
+            document = label == "(full document)"
+            src = meta["source"] if document else f"{meta['source']}::{label}"
+            _collect(extract_candidates(seg_text, src),
+                     _origin_for(src, meta, request_name, document=document))
 
-    # Deduplicate candidates.
+    # Deduplicate candidates by (type, value); the first occurrence is primary.
     dedup: dict[tuple[str, str], Any] = {}
     for c in candidates:
         key = (c.label, c.value)
@@ -197,7 +256,7 @@ def main(argv: list[str] | None = None) -> int:
     report = _build_report(
         candidates, analyses, targets, subdomains,
         results, collections_fetched, requests_count, provider_name,
-        api_key is not None, mask=args.mask_secrets,
+        api_key is not None, mask=args.mask_secrets, origins=origins,
     )
 
     if args.output:
@@ -234,11 +293,26 @@ def _count_items(item: dict) -> int:
 
 def _build_report(candidates, analyses, targets, subdomains, results,
                   collections_fetched, requests_count, provider_name,
-                  postman_key_used, mask=False) -> dict:
+                  postman_key_used, mask=False, origins=None) -> dict:
+    origins = origins or {}
     findings = []
     for cand in candidates:
         key = f"{cand.label}::{cand.value}"
+        locations = origins.get((cand.label, cand.value), [])
+        # Prefer real request/variable/entity locations over the whole-document
+        # fallback, but keep the fallback when it is the only evidence.
+        preferred = [loc for loc in locations if not loc.get("document")]
+        chosen = preferred or locations
+        locations = [{k: v for k, v in loc.items() if k != "document"} for loc in chosen]
+        origin = locations[0] if locations else {}
         finding = {**cand.to_dict(), "analysis": analyses.get(key)}
+        # Where the secret was found (collection, request, and a link if any).
+        finding["collection"] = origin.get("collection", "")
+        finding["collection_id"] = origin.get("collection_id", "")
+        finding["collection_url"] = origin.get("collection_url", "")
+        finding["request"] = origin.get("request")
+        finding["workspace"] = origin.get("workspace", "")
+        finding["locations"] = locations
         if mask:
             finding["value"] = cand.masked()
             finding["masked"] = cand.masked()
@@ -298,5 +372,18 @@ def render_text(report: dict) -> str:
         if a.get("remediation"):
             lines.append(f"   fix: {a['remediation']}")
         lines.append(f"   source: {f['source']}")
+        if f.get("collection"):
+            lines.append(f"   collection: {f['collection']} (id: {f.get('collection_id') or '?'})")
+        if f.get("request"):
+            lines.append(f"   request: {f['request']}")
+        if f.get("collection_url"):
+            lines.append(f"   link: {f['collection_url']}")
+        extra = f.get("locations") or []
+        if len(extra) > 1:
+            lines.append(f"   also seen in {len(extra) - 1} other location(s):")
+            for loc in extra[1:]:
+                lines.append(f"     - {loc.get('source')}"
+                             + (f"  [request: {loc['request']}]" if loc.get("request") else "")
+                             + (f"  {loc['collection_url']}" if loc.get("collection_url") else ""))
         lines.append("")
     return "\n".join(lines)

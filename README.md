@@ -235,7 +235,22 @@ O JSON contém metadados e a lista de `findings`:
       "category": "api_key",
       "value": "AKIA7X4QZR2M9KLPT5V8",
       "entropy": 4.12,
-      "source": "postman-collection:coll1",
+      "source": "postman-collection:2664f86d-f802-463a-b731-b68d6821464b::Payments / Capture a Payment",
+      "collection": "Stripe API Demos",
+      "collection_id": "2664f86d-f802-463a-b731-b68d6821464b",
+      "collection_url": "https://www.postman.com/stripe-developers/collection/2664f86d-f802-463a-b731-b68d6821464b",
+      "request": "Payments / Capture a Payment",
+      "workspace": "Stripe Developers",
+      "locations": [
+        {
+          "source": "postman-collection:2664f86d-f802-463a-b731-b68d6821464b::Payments / Capture a Payment",
+          "collection": "Stripe API Demos",
+          "collection_id": "2664f86d-f802-463a-b731-b68d6821464b",
+          "collection_url": "https://www.postman.com/stripe-developers/collection/2664f86d-f802-463a-b731-b68d6821464b",
+          "request": "Payments / Capture a Payment",
+          "workspace": "Stripe Developers"
+        }
+      ],
       "snippet": "key=api_key value=AKIA7X4QZR2M9KLPT5V8N3",
       "analysis": {
         "criticality": "High",
@@ -250,6 +265,23 @@ O JSON contém metadados e a lista de `findings`:
   ]
 }
 ```
+
+### De onde veio cada chave
+
+Cada `finding` identifica **onde** o segredo foi encontrado:
+
+- `source` — identificador da origem: `postman-collection:<uuid>::<caminho do request>`
+  para achados dentro de uma coleção, ou `postman-<tipo>:<id>` para achados nos
+  metadados da busca (nome/URL de coleções e workspaces).
+- `collection` / `collection_id` / `workspace` — a coleção (nome e UUID) e o
+  workspace de onde veio o segredo.
+- `request` — o request (ou pasta/request) dentro da coleção onde o valor
+  apareceu. É `null` quando o segredo está nas variáveis/auth da coleção.
+- `collection_url` — link público abrível no Postman
+  (`https://www.postman.com/<workspace>/collection/<uuid>`), quando o slug do
+  workspace é conhecido; caso contrário fica vazio (nunca um link quebrado).
+- `locations` — todas as origens onde o mesmo valor (tipo+valor) foi visto,
+  útil quando a mesma chave aparece em várias coleções/requests.
 
 Por padrão, o valor do segredo aparece **em texto claro** (campo `value`). Use
 `--mask-secrets` para mascarar.
@@ -283,6 +315,7 @@ Os endpoints usados podem ser sobrescritos por variáveis de ambiente:
 | `POSTMAN_COLLECTION_URL` | `https://www.postman.com/_api/collection/{cid}?populate=true` |
 | `POSTMAN_COLLECTION_URL_NO_POPULATE` | `https://www.postman.com/_api/collection/{cid}` |
 | `POSTMAN_API_SEARCH_URL` | `https://api.getpostman.com/search?query={query}&type={type}` |
+| `POSTMAN_PUBLIC_BASE` | `https://www.postman.com` (base dos links no relatório) |
 | `SECRET_HUNTER_CRT_SH_URL` | `https://crt.sh/?q=%25.{domain}&output=json` |
 
 Os placeholders `{wid}`, `{cid}`, `{query}` e `{type}` são substituídos na

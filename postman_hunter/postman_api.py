@@ -32,6 +32,8 @@ COLLECTION_URL_NO_POPULATE = os.environ.get("POSTMAN_COLLECTION_URL_NO_POPULATE"
                                             "https://www.postman.com/_api/collection/{cid}")
 API_SEARCH_URL = os.environ.get("POSTMAN_API_SEARCH_URL",
                                 "https://api.getpostman.com/search?query={query}&type={type}")
+# Public web front-end base, used to build human-openable links to entities.
+PUBLIC_BASE = os.environ.get("POSTMAN_PUBLIC_BASE", "https://www.postman.com").rstrip("/")
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -49,6 +51,76 @@ def _session(proxy: str | None = None, timeout: float = 15.0) -> requests.Sessio
     if proxy:
         s.proxies = {"http": proxy, "https": proxy}
     return s
+
+
+def collection_uuid(raw_id: str | None) -> str:
+    """Return the bare collection UUID from a Postman id.
+
+    Search hits expose ids shaped like ``<ownerId>-<uuid>`` (e.g.
+    ``665823-2664f86d-f802-463a-b731-b68d6821464b``) while the fetched
+    collection document reports the bare UUID under ``data.id``.  This helper
+    normalizes either form to the bare UUID used in public links.
+    """
+    if not raw_id:
+        return ""
+    parts = str(raw_id).split("-", 1)
+    if len(parts) == 2 and parts[0].isdigit() and "-" in parts[1]:
+        return parts[1]
+    return str(raw_id)
+
+
+def collection_url(uuid: str | None, workspace_slug: str | None = None) -> str:
+    """Build a human-openable Postman link for a collection, when possible.
+
+    The canonical public URL is ``/{workspace-slug}/collection/{uuid}``.  A
+    workspace slug is required to render it; when it is unknown an empty string
+    is returned rather than a link that 404s.
+    """
+    uuid = collection_uuid(uuid)
+    if not uuid:
+        return ""
+    slug = (workspace_slug or "").strip("/")
+    if slug:
+        return f"{PUBLIC_BASE}/{slug}/collection/{uuid}"
+    return ""
+
+
+def entity_url(entity_type: str, raw_id: str | None,
+               workspace_slug: str | None = None) -> str:
+    """Best-effort public URL for a search entity (collection/workspace/request)."""
+    if entity_type == "collection":
+        return collection_url(raw_id, workspace_slug)
+    if entity_type == "workspace" and workspace_slug:
+        return f"{PUBLIC_BASE}/{workspace_slug.strip('/')}"
+    return ""
+
+
+def collection_meta(collection_data: dict | None, requested_id: str | None = None,
+                    search_meta: dict | None = None) -> dict:
+    """Resolve a fetched collection's identity for finding attribution.
+
+    Returns the bare collection id, its display name, publisher/workspace facts
+    and a public URL (or an empty string when a link cannot be built).
+    """
+    data = (collection_data or {}).get("data", {}) or {}
+    search_meta = search_meta or {}
+    uuid = data.get("id") or (collection_data or {}).get("model_id") or ""
+    public_id = str(requested_id or search_meta.get("id") or "")
+    if not uuid:
+        uuid = collection_uuid(public_id)
+    name = data.get("name") or search_meta.get("name") or ""
+    slug = search_meta.get("workspaceSlug") or search_meta.get("workspace_slug") or ""
+    ident = uuid or public_id or "?"
+    return {
+        "id": uuid,
+        "public_id": public_id or uuid,
+        "name": name,
+        "publisher": search_meta.get("publisher") or "",
+        "workspace": search_meta.get("workspace") or "",
+        "workspace_slug": slug,
+        "url": collection_url(uuid, slug),
+        "source": f"postman-collection:{ident}",
+    }
 
 
 def _search_queries(domain: str) -> list[str]:
@@ -99,6 +171,7 @@ def search_postman(domain: str, api_key: str | None = None,
                         if not eid or eid in seen:
                             continue
                         seen.add(eid)
+                        slug = doc.get("workspaceSlug", "")
                         results.append({
                             "type": entity_type,
                             "name": doc.get("name", ""),
@@ -106,7 +179,8 @@ def search_postman(domain: str, api_key: str | None = None,
                             "publisher": doc.get("publisherHandle", ""),
                             "workspace": doc.get("workspaceName", ""),
                             "workspaceId": doc.get("workspaceId", ""),
-                            "url": doc.get("url", ""),
+                            "workspaceSlug": slug,
+                            "url": doc.get("url", "") or entity_url(entity_type, eid, slug),
                             "method": doc.get("method", ""),
                             "score": item.get("score", 0),
                             "query": query,
@@ -187,59 +261,112 @@ def fetch_collection(collection_id: str, timeout: float = 15.0,
     return None
 
 
-def collection_text(collection_data: dict | None) -> str:
-    """Flatten a collection into a text blob for the secret pattern catalog.
+def _request_text(req: dict) -> str:
+    """Render one request as text: name, method, url, headers, body, auth."""
+    parts: list[str] = []
+    parts.append(str(req.get("name", "")))
+    parts.append(str(req.get("method", "")))
+    url = req.get("url", "")
+    if isinstance(url, dict):
+        url = url.get("raw", "")
+    parts.append(str(url))
+    for h in (req.get("headerData") or req.get("header") or []):
+        if isinstance(h, dict) and h.get("key"):
+            parts.append(f"{h.get('key')}: {h.get('value', '')}")
+        elif isinstance(h, str):
+            parts.append(h)
+    if isinstance(req.get("headers"), str):
+        parts.append(req["headers"])
+    body = req.get("rawModeData")
+    if not body:
+        body = req.get("body") or req.get("data")
+    if isinstance(body, dict):
+        body = body.get("raw") or json.dumps(body.get("formdata", []), ensure_ascii=False)
+    elif isinstance(body, list):
+        body = json.dumps(body, ensure_ascii=False)
+    parts.append(str(body) if body else "")
+    if req.get("auth"):
+        parts.append(json.dumps(req.get("auth", {}), ensure_ascii=False))
+    return "\n".join(p for p in parts if p)
 
-    The full JSON is scanned (covers every field), plus the request URLs,
-    headers, bodies, variables and auth are rendered as text so that values
-    hidden behind nested structures are still reached.
+
+def collection_segments(collection_data: dict | None) -> list[tuple[str, str]]:
+    """Split a collection into labelled text segments for attributed scanning.
+
+    Returns ``(label, text)`` pairs: one for collection-level variables/auth,
+    one per request (labelled with its folder/name path) and a final full
+    document segment so nothing nested is missed.  The label lets callers record
+    *where inside the collection* a candidate was found.
     """
     if not collection_data:
-        return ""
-    parts: list[str] = []
-
+        return []
     data = collection_data.get("data", {}) or {}
+    segments: list[tuple[str, str]] = []
 
-    # Collection-level variables.
-    variables = data.get("variable", []) or data.get("variables", []) or []
+    variables = data.get("variables") or data.get("variable") or []
+    vparts: list[str] = []
     for var in variables:
         if isinstance(var, dict):
-            parts.append(f"key={var.get('key', '')} value={var.get('value', '')}")
+            vparts.append(f"key={var.get('key', '')} value={var.get('value', '')}")
+    if vparts:
+        segments.append(("collection variables", "\n".join(vparts)))
 
-    # Requests (legacy flat + v2 nested).
-    for req in _iter_requests(data):
-        url = req.get("url", "")
-        if isinstance(url, dict):
-            url = url.get("raw", "")
-        parts.append(req.get("name", ""))
-        parts.append(req.get("method", ""))
-        parts.append(str(url))
-        for h in (req.get("header", []) or req.get("headerData", []) or []):
-            if isinstance(h, dict) and h.get("key"):
-                parts.append(f"{h.get('key')}: {h.get('value', '')}")
-        body = req.get("body", "")
-        if isinstance(body, dict):
-            body = body.get("raw", "") or json.dumps(body.get("formdata", []))
-        parts.append(str(body))
-        parts.append(json.dumps(req.get("auth", {}), ensure_ascii=False))
+    if data.get("auth"):
+        segments.append(("collection auth", json.dumps(data["auth"], ensure_ascii=False)))
 
-    # The whole document as JSON, so nothing is missed.
-    parts.append(json.dumps(collection_data, ensure_ascii=False))
-    return "\n".join(p for p in parts if p)
+    for path, req in _iter_requests_with_path(data):
+        segments.append((path or "(request)", _request_text(req)))
+
+    segments.append(("(full document)", json.dumps(collection_data, ensure_ascii=False)))
+    return segments
+
+
+def collection_text(collection_data: dict | None) -> str:
+    """Flatten a collection into a single text blob for the secret catalog."""
+    return "\n".join(text for _, text in collection_segments(collection_data))
+
+
+def _folder_names(data: dict) -> dict[str, str]:
+    names: dict[str, str] = {}
+    for f in (data.get("folders") or []):
+        if isinstance(f, dict) and f.get("id"):
+            names[str(f["id"])] = f.get("name", "") or ""
+    return names
+
+
+def _iter_requests_with_path(data: dict):
+    """Yield ``(path, request)`` for legacy flat and v2 nested collections."""
+    folder_names = _folder_names(data)
+    for req in (data.get("requests", []) or []):
+        if isinstance(req, dict):
+            fname = folder_names.get(str(req.get("folder", "")), "")
+            path = f"{fname} / {req.get('name', '')}".strip(" /")
+            yield path, req
+    for item in (data.get("item", []) or []):
+        yield from _walk_items_with_path(item, "")
+
+
+def _walk_items_with_path(item: dict, prefix: str):
+    name = item.get("name", "") or ""
+    if "item" in item:
+        new_prefix = f"{prefix} / {name}".strip(" /") if name else prefix
+        for child in item.get("item", []):
+            yield from _walk_items_with_path(child, new_prefix)
+    elif "request" in item:
+        path = f"{prefix} / {name}".strip(" /") if prefix else name
+        req = item.get("request", {})
+        if isinstance(req, str):
+            req = {"url": req}
+        yield path, {"name": name, **req}
 
 
 def _iter_requests(data: dict):
     """Yield request-like dicts from legacy and v2 collection shapes."""
-    for req in data.get("requests", []):
-        if isinstance(req, dict):
-            yield req
-    for item in (data.get("item", []) or []):
-        yield from _walk_items(item)
+    for _, req in _iter_requests_with_path(data):
+        yield req
 
 
 def _walk_items(item: dict):
-    if "item" in item:
-        for child in item.get("item", []):
-            yield from _walk_items(child)
-    elif "request" in item:
-        yield {"name": item.get("name", ""), **item.get("request", {})}
+    for _, req in _walk_items_with_path(item, ""):
+        yield req
+
